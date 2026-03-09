@@ -1,280 +1,318 @@
 import os
 import time
-import hashlib
+import json
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'skapa-api-secret')
 
-PLATFORM_URL = os.environ.get('PLATFORM_URL', 'https://platform.skapa.design')
-OLLAMA_API_URL = os.environ.get('OLLAMA_API_URL', 'https://ollama.com/api')
-OLLAMA_API_KEY = os.environ.get('OLLAMA_API_KEY', '')
-DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'deepseek-v3.2')
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+PLATFORM_URL = os.environ.get("PLATFORM_URL", "https://platform.skapa.design")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/api")
+OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "deepseek-r1")
+DEV_MODE = os.environ.get("DEV_MODE", "false").lower() in ("true", "1", "yes")
 
-VALIDATED_KEYS = {}
-KEY_CACHE_TTL = 300
+# Cache des clés API validées (dict Python avec TTL)
+_key_cache = {}
+KEY_CACHE_TTL = 300  # 5 minutes
 
+http_session = requests.Session()
 
-def validate_api_key(auth_header):
-    if not auth_header or not auth_header.startswith('Bearer '):
-        return None, 'Clé API manquante ou format invalide'
+# ---------------------------------------------------------------------------
+# Validation des clés API
+# ---------------------------------------------------------------------------
 
-    key = auth_header[7:]
-    cache_key = hashlib.sha256(key.encode()).hexdigest()
-    now = time.time()
-
-    if cache_key in VALIDATED_KEYS:
-        entry = VALIDATED_KEYS[cache_key]
-        if now - entry['ts'] < KEY_CACHE_TTL:
-            return entry['user'], None
-
+def _validate_single_key(api_key: str) -> bool:
+    """Valide une clé API auprès de la plateforme Skapa."""
     try:
-        resp = requests.post(
-            f'{PLATFORM_URL}/api/v1/validate-single-key',
-            json={'key_to_validate': key},
+        resp = http_session.post(
+            f"{PLATFORM_URL}/api/v1/validate-single-key",
+            json={"api_key": api_key},
             timeout=10,
-            verify=False
         )
         if resp.status_code == 200:
             data = resp.json()
-            if data.get('valid'):
-                user_info = data.get('user', {})
-                VALIDATED_KEYS[cache_key] = {'user': user_info, 'ts': now}
-                return user_info, None
-            return None, data.get('error', 'Clé invalide')
-        return None, f'Validation échouée (HTTP {resp.status_code})'
-    except requests.RequestException as e:
-        if cache_key in VALIDATED_KEYS:
-            return VALIDATED_KEYS[cache_key]['user'], None
-        return None, f'Service de validation indisponible: {e}'
+            return data.get("valid", False)
+        return False
+    except Exception as e:
+        print(f"Erreur validation clé : {e}")
+        return False
 
 
-def report_usage_to_platform(api_key, model, prompt_tokens, completion_tokens, response_time_ms=None, client_ip=None):
-    """Fire-and-forget usage reporting to the platform"""
-    try:
-        requests.post(
-            f'{PLATFORM_URL}/api/v1/report-usage',
-            json={
-                'api_key': api_key,
-                'model': model,
-                'prompt_tokens': prompt_tokens,
-                'completion_tokens': completion_tokens,
-                'status_code': 200,
-                'response_time_ms': response_time_ms,
-                'client_ip': client_ip
-            },
-            timeout=5,
-            verify=False
-        )
-    except Exception:
-        pass
+def is_key_valid(api_key: str) -> bool:
+    """Vérifie la validité d'une clé avec cache en mémoire (TTL 5 min)."""
+    now = time.time()
+    cached = _key_cache.get(api_key)
+    if cached and (now - cached["ts"]) < KEY_CACHE_TTL:
+        return cached["valid"]
+
+    valid = _validate_single_key(api_key)
+    _key_cache[api_key] = {"valid": valid, "ts": now}
+    return valid
 
 
-def call_ollama(model, messages, temperature=0.7, max_tokens=2048):
-    payload = {
-        'model': model,
-        'messages': messages,
-        'stream': False,
-        'options': {
-            'temperature': temperature,
-            'num_predict': max_tokens
-        }
-    }
-    headers = {'Content-Type': 'application/json'}
+def get_api_key():
+    """Extrait et valide la clé API du header Authorization."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, (jsonify({"error": "Clé API manquante ou invalide"}), 401)
+    key = auth[7:]
+    if DEV_MODE:
+        return key, None
+    if not is_key_valid(key):
+        return None, (jsonify({"error": "Clé API non autorisée"}), 403)
+    return key, None
+
+
+# ---------------------------------------------------------------------------
+# Helpers Ollama
+# ---------------------------------------------------------------------------
+
+def _ollama_chat(payload: dict) -> requests.Response:
+    """Envoie une requête chat à Ollama Cloud."""
+    payload.setdefault("model", DEFAULT_MODEL)
+    payload["stream"] = False  # synchrone pour cPanel/Passenger
+
+    headers = {"Content-Type": "application/json"}
     if OLLAMA_API_KEY:
-        headers['Authorization'] = f'Bearer {OLLAMA_API_KEY}'
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
 
-    resp = requests.post(
-        f'{OLLAMA_API_URL}/chat',
+    return http_session.post(
+        f"{OLLAMA_BASE_URL}/chat",
         json=payload,
         headers=headers,
-        timeout=120
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-@app.route('/v1/chat/completions', methods=['POST'])
-def chat_completions():
-    auth_header = request.headers.get('Authorization')
-    user, error = validate_api_key(auth_header)
-    if error:
-        return jsonify({'error': {'message': error, 'type': 'authentication_error'}}), 401
-
-    data = request.get_json()
-    if not data or 'messages' not in data:
-        return jsonify({'error': {'message': 'messages field required', 'type': 'invalid_request'}}), 400
-
-    model = data.get('model', DEFAULT_MODEL)
-    messages = data['messages']
-    temperature = data.get('temperature', 0.7)
-    max_tokens = data.get('max_tokens', 2048)
-
-    start_time = time.time()
-    try:
-        result = call_ollama(model, messages, temperature, max_tokens)
-    except requests.HTTPError as e:
-        return jsonify({'error': {'message': f'LLM backend error: {e}', 'type': 'server_error'}}), 502
-    except requests.RequestException as e:
-        return jsonify({'error': {'message': f'LLM backend unavailable: {e}', 'type': 'server_error'}}), 503
-    elapsed_ms = round((time.time() - start_time) * 1000, 1)
-
-    response_message = result.get('message', {})
-    content = response_message.get('content', '')
-    thinking = response_message.get('thinking', '')
-    if not content and thinking:
-        content = thinking
-
-    prompt_tokens = result.get('prompt_eval_count', 0)
-    completion_tokens = result.get('eval_count', 0)
-
-    openai_response = {
-        'id': f'chatcmpl-{int(time.time())}',
-        'object': 'chat.completion',
-        'created': int(time.time()),
-        'model': model,
-        'choices': [{
-            'index': 0,
-            'message': {
-                'role': response_message.get('role', 'assistant'),
-                'content': content
-            },
-            'finish_reason': result.get('done_reason', 'stop')
-        }],
-        'usage': {
-            'prompt_tokens': prompt_tokens,
-            'completion_tokens': completion_tokens,
-            'total_tokens': prompt_tokens + completion_tokens
-        }
-    }
-
-    api_key = auth_header[7:] if auth_header else ''
-    report_usage_to_platform(
-        api_key=api_key,
-        model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        response_time_ms=elapsed_ms,
-        client_ip=request.remote_addr
+        timeout=120,
     )
 
-    return jsonify(openai_response)
 
+def _ollama_generate(payload: dict) -> requests.Response:
+    """Envoie une requête generate à Ollama Cloud."""
+    payload.setdefault("model", DEFAULT_MODEL)
+    payload["stream"] = False
 
-@app.route('/v1/completions', methods=['POST'])
-def completions():
-    auth_header = request.headers.get('Authorization')
-    user, error = validate_api_key(auth_header)
-    if error:
-        return jsonify({'error': {'message': error, 'type': 'authentication_error'}}), 401
+    headers = {"Content-Type": "application/json"}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
 
-    data = request.get_json()
-    if not data or 'prompt' not in data:
-        return jsonify({'error': {'message': 'prompt field required', 'type': 'invalid_request'}}), 400
-
-    model = data.get('model', DEFAULT_MODEL)
-    prompt = data['prompt']
-    temperature = data.get('temperature', 0.7)
-    max_tokens = data.get('max_tokens', 2048)
-
-    messages = [{'role': 'user', 'content': prompt}]
-
-    start_time = time.time()
-    try:
-        result = call_ollama(model, messages, temperature, max_tokens)
-    except requests.HTTPError as e:
-        return jsonify({'error': {'message': f'LLM backend error: {e}', 'type': 'server_error'}}), 502
-    except requests.RequestException as e:
-        return jsonify({'error': {'message': f'LLM backend unavailable: {e}', 'type': 'server_error'}}), 503
-    elapsed_ms = round((time.time() - start_time) * 1000, 1)
-
-    response_message = result.get('message', {})
-    prompt_tokens = result.get('prompt_eval_count', 0)
-    completion_tokens = result.get('eval_count', 0)
-
-    openai_response = {
-        'id': f'cmpl-{int(time.time())}',
-        'object': 'text_completion',
-        'created': int(time.time()),
-        'model': model,
-        'choices': [{
-            'text': response_message.get('content', ''),
-            'index': 0,
-            'finish_reason': 'stop'
-        }],
-        'usage': {
-            'prompt_tokens': prompt_tokens,
-            'completion_tokens': completion_tokens,
-            'total_tokens': prompt_tokens + completion_tokens
-        }
-    }
-
-    api_key = auth_header[7:] if auth_header else ''
-    report_usage_to_platform(
-        api_key=api_key,
-        model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        response_time_ms=elapsed_ms,
-        client_ip=request.remote_addr
+    return http_session.post(
+        f"{OLLAMA_BASE_URL}/generate",
+        json=payload,
+        headers=headers,
+        timeout=120,
     )
 
-    return jsonify(openai_response)
 
-
-AVAILABLE_MODELS = [
-    {'id': 'deepseek-v3.2', 'description': 'Raisonnement avancé'},
-    {'id': 'qwen3-coder-next', 'description': 'Coding agent'},
-    {'id': 'devstral-2:123b', 'description': 'Coding 123B'},
-    {'id': 'devstral-small-2:24b', 'description': 'Coding 24B'},
-    {'id': 'gemma3:27b', 'description': 'Google Gemma 3'},
-    {'id': 'glm-5', 'description': 'Raisonnement 744B'},
-    {'id': 'minimax-m2.5', 'description': 'Coding/productivité'},
-]
-
-
-@app.route('/v1/models', methods=['GET'])
-def list_models():
-    user, error = validate_api_key(request.headers.get('Authorization'))
-    if error:
-        return jsonify({'error': {'message': error, 'type': 'authentication_error'}}), 401
-
-    models_list = [{
-        'id': m['id'],
-        'object': 'model',
-        'created': 1700000000,
-        'owned_by': 'skapa',
-        'description': m['description']
-    } for m in AVAILABLE_MODELS]
-
-    return jsonify({'object': 'list', 'data': models_list})
-
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok', 'timestamp': int(time.time()), 'version': '1.0.0'})
-
-
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({
-        'name': 'Skapa API',
-        'version': '1.0.0',
-        'description': 'Gateway API compatible OpenAI — Skapa',
-        'endpoints': {
-            '/v1/chat/completions': 'POST — Chat completions (OpenAI-compatible)',
-            '/v1/completions': 'POST — Text completions',
-            '/v1/models': 'GET — List available models',
-            '/health': 'GET — Health check',
+def _openai_to_ollama_chat(openai_payload: dict) -> dict:
+    """Convertit un payload OpenAI chat/completions vers le format Ollama."""
+    messages = openai_payload.get("messages", [])
+    return {
+        "model": openai_payload.get("model", DEFAULT_MODEL),
+        "messages": messages,
+        "options": {
+            "temperature": openai_payload.get("temperature", 0.7),
+            "top_p": openai_payload.get("top_p", 1.0),
         },
-        'authentication': 'Bearer token (get your API key at platform.skapa.design)',
-        'documentation': 'https://platform.skapa.design/api-docs/'
-    })
+    }
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+def _ollama_to_openai_chat(ollama_resp: dict, model: str) -> dict:
+    """Convertit une réponse Ollama en format OpenAI."""
+    message = ollama_resp.get("message", {})
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": message.get("role", "assistant"),
+                    "content": message.get("content", ""),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": ollama_resp.get("prompt_eval_count", 0),
+            "completion_tokens": ollama_resp.get("eval_count", 0),
+            "total_tokens": (
+                ollama_resp.get("prompt_eval_count", 0)
+                + ollama_resp.get("eval_count", 0)
+            ),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/v1/chat/completions", methods=["POST"])
+def chat_completions():
+    key, err = get_api_key()
+    if err:
+        return err
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    model = payload.get("model", DEFAULT_MODEL)
+    ollama_payload = _openai_to_ollama_chat(payload)
+
+    try:
+        resp = _ollama_chat(ollama_payload)
+        resp.raise_for_status()
+        result = _ollama_to_openai_chat(resp.json(), model)
+        return jsonify(result)
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "LLM timeout"}), 504
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Service LLM indisponible"}), 503
+    except Exception as e:
+        return jsonify({"error": f"Erreur interne du proxy : {e}"}), 500
+
+
+@app.route("/v1/completions", methods=["POST"])
+def completions():
+    key, err = get_api_key()
+    if err:
+        return err
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    prompt = payload.get("prompt", "")
+    model = payload.get("model", DEFAULT_MODEL)
+
+    ollama_payload = {
+        "model": model,
+        "prompt": prompt,
+        "options": {
+            "temperature": payload.get("temperature", 0.7),
+        },
+    }
+
+    try:
+        resp = _ollama_generate(ollama_payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+        result = {
+            "id": f"cmpl-{int(time.time())}",
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "text": data.get("response", ""),
+                    "index": 0,
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": data.get("prompt_eval_count", 0),
+                "completion_tokens": data.get("eval_count", 0),
+                "total_tokens": (
+                    data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
+                ),
+            },
+        }
+        return jsonify(result)
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "LLM timeout"}), 504
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Service LLM indisponible"}), 503
+    except Exception as e:
+        return jsonify({"error": f"Erreur interne du proxy : {e}"}), 500
+
+
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    key, err = get_api_key()
+    if err:
+        return err
+
+    try:
+        headers = {}
+        if OLLAMA_API_KEY:
+            headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
+        resp = http_session.get(
+            f"{OLLAMA_BASE_URL}/tags",
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        ollama_models = resp.json().get("models", [])
+
+        openai_models = []
+        for m in ollama_models:
+            openai_models.append(
+                {
+                    "id": m.get("name", "unknown"),
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "skapa",
+                }
+            )
+
+        return jsonify({"object": "list", "data": openai_models})
+    except Exception as e:
+        return jsonify({"error": f"Impossible de lister les modèles : {e}"}), 503
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "timestamp": int(time.time())})
+
+
+@app.route("/docs", methods=["GET"])
+def docs():
+    return """<!DOCTYPE html>
+<html><head><title>Skapa API Docs</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#333}
+h1{color:#2563eb}h2{color:#1e40af;border-bottom:2px solid #e5e7eb;padding-bottom:8px}
+code{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:.9em}
+pre{background:#1e293b;color:#e2e8f0;padding:16px;border-radius:8px;overflow-x:auto}
+.method{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:700;font-size:.85em;margin-right:8px}
+.post{background:#22c55e;color:#fff}.get{background:#3b82f6;color:#fff}
+</style></head><body>
+<h1>Skapa API Gateway</h1>
+<p>Gateway compatible OpenAI. Authentification par clé API (Bearer token).</p>
+
+<h2>Endpoints</h2>
+
+<h3><span class="method post">POST</span><code>/v1/chat/completions</code></h3>
+<p>Chat completion compatible OpenAI.</p>
+<pre>curl -X POST https://api.skapa.design/v1/chat/completions \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"deepseek-r1","messages":[{"role":"user","content":"Bonjour"}]}'</pre>
+
+<h3><span class="method post">POST</span><code>/v1/completions</code></h3>
+<p>Text completion compatible OpenAI.</p>
+
+<h3><span class="method get">GET</span><code>/v1/models</code></h3>
+<p>Liste les modèles disponibles.</p>
+
+<h3><span class="method get">GET</span><code>/health</code></h3>
+<p>Healthcheck (pas d'auth requise).</p>
+
+<h2>Authentification</h2>
+<p>Ajoutez un header <code>Authorization: Bearer VOTRE_CLE_API</code> à chaque requête.</p>
+<p>Obtenez votre clé sur <a href="https://platform.skapa.design">platform.skapa.design</a>.</p>
+</body></html>"""
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
