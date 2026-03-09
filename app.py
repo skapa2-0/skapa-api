@@ -53,6 +53,27 @@ def validate_api_key(auth_header):
         return None, f'Service de validation indisponible: {e}'
 
 
+def report_usage_to_platform(api_key, model, prompt_tokens, completion_tokens, response_time_ms=None, client_ip=None):
+    """Fire-and-forget usage reporting to the platform"""
+    try:
+        requests.post(
+            f'{PLATFORM_URL}/api/v1/report-usage',
+            json={
+                'api_key': api_key,
+                'model': model,
+                'prompt_tokens': prompt_tokens,
+                'completion_tokens': completion_tokens,
+                'status_code': 200,
+                'response_time_ms': response_time_ms,
+                'client_ip': client_ip
+            },
+            timeout=5,
+            verify=False
+        )
+    except Exception:
+        pass
+
+
 def call_ollama(model, messages, temperature=0.7, max_tokens=2048):
     payload = {
         'model': model,
@@ -79,7 +100,8 @@ def call_ollama(model, messages, temperature=0.7, max_tokens=2048):
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
-    user, error = validate_api_key(request.headers.get('Authorization'))
+    auth_header = request.headers.get('Authorization')
+    user, error = validate_api_key(auth_header)
     if error:
         return jsonify({'error': {'message': error, 'type': 'authentication_error'}}), 401
 
@@ -92,18 +114,23 @@ def chat_completions():
     temperature = data.get('temperature', 0.7)
     max_tokens = data.get('max_tokens', 2048)
 
+    start_time = time.time()
     try:
         result = call_ollama(model, messages, temperature, max_tokens)
     except requests.HTTPError as e:
         return jsonify({'error': {'message': f'LLM backend error: {e}', 'type': 'server_error'}}), 502
     except requests.RequestException as e:
         return jsonify({'error': {'message': f'LLM backend unavailable: {e}', 'type': 'server_error'}}), 503
+    elapsed_ms = round((time.time() - start_time) * 1000, 1)
 
     response_message = result.get('message', {})
     content = response_message.get('content', '')
     thinking = response_message.get('thinking', '')
     if not content and thinking:
         content = thinking
+
+    prompt_tokens = result.get('prompt_eval_count', 0)
+    completion_tokens = result.get('eval_count', 0)
 
     openai_response = {
         'id': f'chatcmpl-{int(time.time())}',
@@ -119,17 +146,29 @@ def chat_completions():
             'finish_reason': result.get('done_reason', 'stop')
         }],
         'usage': {
-            'prompt_tokens': result.get('prompt_eval_count', 0),
-            'completion_tokens': result.get('eval_count', 0),
-            'total_tokens': result.get('prompt_eval_count', 0) + result.get('eval_count', 0)
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': prompt_tokens + completion_tokens
         }
     }
+
+    api_key = auth_header[7:] if auth_header else ''
+    report_usage_to_platform(
+        api_key=api_key,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        response_time_ms=elapsed_ms,
+        client_ip=request.remote_addr
+    )
+
     return jsonify(openai_response)
 
 
 @app.route('/v1/completions', methods=['POST'])
 def completions():
-    user, error = validate_api_key(request.headers.get('Authorization'))
+    auth_header = request.headers.get('Authorization')
+    user, error = validate_api_key(auth_header)
     if error:
         return jsonify({'error': {'message': error, 'type': 'authentication_error'}}), 401
 
@@ -144,14 +183,19 @@ def completions():
 
     messages = [{'role': 'user', 'content': prompt}]
 
+    start_time = time.time()
     try:
         result = call_ollama(model, messages, temperature, max_tokens)
     except requests.HTTPError as e:
         return jsonify({'error': {'message': f'LLM backend error: {e}', 'type': 'server_error'}}), 502
     except requests.RequestException as e:
         return jsonify({'error': {'message': f'LLM backend unavailable: {e}', 'type': 'server_error'}}), 503
+    elapsed_ms = round((time.time() - start_time) * 1000, 1)
 
     response_message = result.get('message', {})
+    prompt_tokens = result.get('prompt_eval_count', 0)
+    completion_tokens = result.get('eval_count', 0)
+
     openai_response = {
         'id': f'cmpl-{int(time.time())}',
         'object': 'text_completion',
@@ -163,11 +207,22 @@ def completions():
             'finish_reason': 'stop'
         }],
         'usage': {
-            'prompt_tokens': result.get('prompt_eval_count', 0),
-            'completion_tokens': result.get('eval_count', 0),
-            'total_tokens': result.get('prompt_eval_count', 0) + result.get('eval_count', 0)
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': prompt_tokens + completion_tokens
         }
     }
+
+    api_key = auth_header[7:] if auth_header else ''
+    report_usage_to_platform(
+        api_key=api_key,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        response_time_ms=elapsed_ms,
+        client_ip=request.remote_addr
+    )
+
     return jsonify(openai_response)
 
 
