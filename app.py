@@ -36,7 +36,8 @@ def validate_api_key(auth_header):
         resp = requests.post(
             f'{PLATFORM_URL}/api/v1/validate-single-key',
             json={'key_to_validate': key},
-            timeout=10
+            timeout=10,
+            verify=False
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -99,6 +100,11 @@ def chat_completions():
         return jsonify({'error': {'message': f'LLM backend unavailable: {e}', 'type': 'server_error'}}), 503
 
     response_message = result.get('message', {})
+    content = response_message.get('content', '')
+    thinking = response_message.get('thinking', '')
+    if not content and thinking:
+        content = thinking
+
     openai_response = {
         'id': f'chatcmpl-{int(time.time())}',
         'object': 'chat.completion',
@@ -108,9 +114,9 @@ def chat_completions():
             'index': 0,
             'message': {
                 'role': response_message.get('role', 'assistant'),
-                'content': response_message.get('content', '')
+                'content': content
             },
-            'finish_reason': 'stop'
+            'finish_reason': result.get('done_reason', 'stop')
         }],
         'usage': {
             'prompt_tokens': result.get('prompt_eval_count', 0),
